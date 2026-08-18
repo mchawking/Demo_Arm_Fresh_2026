@@ -1,0 +1,20 @@
+# PlatformIO build output
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Local editor and workspace settings
+.vscode/
+*.code-workspace
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Local environment files
+.env
+
+# Dated local provenance backups
+*.proven-*
+
+milestone_proven_esp32_can_motion_20260319.zip
