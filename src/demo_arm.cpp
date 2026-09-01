@@ -1,6 +1,6 @@
 #include "demo_arm.h"
 
-#include <Arduino.h>
+#include "Arduino.h"
 #include <Wire.h>
 #include <driver/twai.h>
 #include <string.h>
@@ -50,13 +50,13 @@ Notes:
 
 // CRSF receiver wiring
 #define CRSF_SERIAL       Serial1
-#define CRSF_RX_PIN       16
-#define CRSF_TX_PIN       17
+#define CRSF_RX_PIN       17
+#define CRSF_TX_PIN       16
 #define CRSF_BAUD         420000
 
 // CAN transceiver wiring / bus config
-#define CAN_RX_PIN       GPIO_NUM_10  // previously 21
-#define CAN_TX_PIN       GPIO_NUM_11  // previously 18
+#define CAN_RX_PIN       GPIO_NUM_11  // previously 21
+#define CAN_TX_PIN       GPIO_NUM_10  // previously 18
 #define ODRIVE_CAN_BAUD  250000
 
 // ODrive CANSimple command IDs
@@ -64,6 +64,7 @@ Notes:
 #define ODRIVE_CMD_SET_AXIS_STATE       0x07
 #define ODRIVE_CMD_SET_CONTROLLER_MODES 0x0B
 #define ODRIVE_CMD_SET_INPUT_POS        0x0C
+#define ODRIVE_CMD_HEARTBEAT            0x01
 
 #define ODRIVE_AXIS_STATE_IDLE          1u
 #define ODRIVE_AXIS_STATE_CLOSED_LOOP   8u
@@ -79,6 +80,8 @@ Notes:
 
 // Runtime timing
 #define ODRIVE_SEND_PERIOD_MS   20
+#define ODRIVE_FEEDBACK_TIMEOUT_MS 250
+#define ODRIVE_HEARTBEAT_TIMEOUT_MS 1000
 
 // Safety / controls
 #define ARM_SWITCH_CHANNEL      5
@@ -91,6 +94,9 @@ Notes:
 #define CAL_DIR_VEL_DEADBAND    0.01f
 #define CAL_FEED_PERIOD_MS      250
 #define CAL_FEED_TURN_DELTA     0.001f
+
+// Debug mode: dumps CRSF channels and raw CAN RX frames to serial
+#define DEBUG_CHANNELS_PERIOD_MS 500
 
 // FRAM (MB85RC-style over I2C)
 #define FRAM_I2C_ADDRESS        0x50
@@ -121,6 +127,11 @@ struct AxisRuntime {
   float measuredTurns;
   float measuredVel;
   bool measuredValid;
+  unsigned long lastFeedbackMs;
+  uint32_t axisError;
+  uint8_t axisState;
+  bool heartbeatValid;
+  unsigned long lastHeartbeatMs;
   float rampStartTurns;
   unsigned long rampStartMs;
   bool rampingToHome;
@@ -171,6 +182,8 @@ static uint8_t       _rxLen = 0;
 static bool          _canReady = false;
 static bool          _prevArmed = false;
 static unsigned long _lastOdriveSendMs = 0;
+static bool          gOdriveFaultLatched = false;
+static unsigned long gLastSafetyReportMs = 0;
 
 static bool          gFramDetected = false;
 static bool          gFramSelfTestOk = false;
@@ -192,6 +205,9 @@ static unsigned long gBtnPressStartMs = 0;
 
 static char          gSerialCmdBuf[48];
 static uint8_t       gSerialCmdLen = 0;
+
+static bool          gDebugMode = false;
+static unsigned long gDebugChannelsLastMs = 0;
 
 static float clampf(float value, float minV, float maxV) {
   if (value < minV) return minV;
@@ -464,14 +480,23 @@ static bool initCanBus() {
   return true;
 }
 
+static void printDebugCanFrame(const twai_message_t& rx, uint8_t nodeId, uint8_t cmdId) {
+  Serial.printf("CAN RX id=0x%03lX node=%u cmd=0x%02X dlc=%u data=",
+                (unsigned long)rx.identifier, nodeId, cmdId, rx.data_length_code);
+  for (int i = 0; i < rx.data_length_code; i++) {
+    Serial.printf("%02X ", rx.data[i]);
+  }
+  Serial.println();
+}
+
 static void processCanRx() {
   twai_message_t rx = {};
   while (twai_receive(&rx, 0) == ESP_OK) {
     uint8_t nodeId = (uint8_t)(rx.identifier >> 5);
     uint8_t cmdId = (uint8_t)(rx.identifier & 0x1F);
 
-    if (cmdId != ODRIVE_CMD_GET_ENCODER_ESTIMATES || rx.data_length_code < 8) {
-      continue;
+    if (gDebugMode) {
+      printDebugCanFrame(rx, nodeId, cmdId);
     }
 
     for (int i = 0; i < 3; i++) {
@@ -479,11 +504,42 @@ static void processCanRx() {
         continue;
       }
 
-      memcpy(&gRt[i].measuredTurns, &rx.data[0], 4);
-      memcpy(&gRt[i].measuredVel, &rx.data[4], 4);
-      gRt[i].measuredValid = true;
+      if (cmdId == ODRIVE_CMD_GET_ENCODER_ESTIMATES && rx.data_length_code >= 8) {
+        memcpy(&gRt[i].measuredTurns, &rx.data[0], 4);
+        memcpy(&gRt[i].measuredVel, &rx.data[4], 4);
+        gRt[i].measuredValid = true;
+        gRt[i].lastFeedbackMs = millis();
+      } else if (cmdId == ODRIVE_CMD_HEARTBEAT && rx.data_length_code >= 5) {
+        memcpy(&gRt[i].axisError, &rx.data[0], 4);
+        gRt[i].axisState = rx.data[4];
+        gRt[i].heartbeatValid = true;
+        gRt[i].lastHeartbeatMs = millis();
+      }
       break;
     }
+  }
+}
+
+static bool axisFeedbackFresh(uint8_t axis, unsigned long nowMs) {
+  return gRt[axis].measuredValid &&
+         (nowMs - gRt[axis].lastFeedbackMs <= ODRIVE_FEEDBACK_TIMEOUT_MS);
+}
+
+static bool axesReadyForControl(unsigned long nowMs) {
+  for (uint8_t i = 0; i < 3; i++) {
+    if (!axisFeedbackFresh(i, nowMs) || gRt[i].axisError != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void idleAllAxes() {
+  if (!_canReady) {
+    return;
+  }
+  for (uint8_t i = 0; i < 3; i++) {
+    sendOdriveSetState(gAxes[i].nodeId, ODRIVE_AXIS_STATE_IDLE);
   }
 }
 
@@ -527,9 +583,8 @@ static void enterCalibrationMode() {
   gCalFeedLastDir = 0;
   _prevArmed = false;
 
+  idleAllAxes();
   for (int i = 0; i < 3; i++) {
-    sendOdriveControllerModes(gAxes[i].nodeId, ODRIVE_CONTROL_MODE_POSITION, ODRIVE_INPUT_MODE_PASSTHROUGH);
-    sendOdriveSetState(gAxes[i].nodeId, ODRIVE_AXIS_STATE_CLOSED_LOOP);
     gRt[i].rampingToHome = false;
   }
 
@@ -851,6 +906,56 @@ static void printCalibrationHelp() {
   Serial.println("  CAL STATUS  -> print state + measured turns + vel + POSITIVE/NEGATIVE direction");
   Serial.println("  CAL FEED ON -> enable live turns feed during calibration");
   Serial.println("  CAL FEED OFF-> disable live turns feed during calibration");
+  Serial.println("  DEBUG ON    -> print CRSF channels + raw CAN RX frames to serial");
+  Serial.println("  DEBUG OFF   -> stop debug output");
+  Serial.println("  STATUS      -> print CRSF, CAN, ODrive feedback, heartbeat, and fault state");
+  Serial.println("  FAULT CLEAR -> clear ODrive safety latch while disarmed and feedback is fresh");
+}
+
+static void printSystemStatus() {
+  unsigned long nowMs = millis();
+  Serial.printf("STATUS crsf=%s can=%s armed=%s latch=%s\n",
+                hasSignal() ? "OK" : "LOST",
+                _canReady ? "OK" : "FAIL",
+                (hasSignal() && getChannel(ARM_SWITCH_CHANNEL) > ARM_THRESHOLD) ? "YES" : "NO",
+                gOdriveFaultLatched ? "SET" : "CLEAR");
+  if (_canReady) {
+    twai_status_info_t canStatus = {};
+    if (twai_get_status_info(&canStatus) == ESP_OK) {
+      Serial.printf("  twai state=%d tx_pending=%lu rx_pending=%lu tx_failed=%lu rx_missed=%lu\n",
+                    canStatus.state,
+                    (unsigned long)canStatus.msgs_to_tx,
+                    (unsigned long)canStatus.msgs_to_rx,
+                    (unsigned long)canStatus.tx_failed_count,
+                    (unsigned long)canStatus.rx_missed_count);
+    }
+  }
+  for (uint8_t i = 0; i < 3; i++) {
+    unsigned long feedbackAge = gRt[i].measuredValid ? nowMs - gRt[i].lastFeedbackMs : 0;
+    unsigned long heartbeatAge = gRt[i].heartbeatValid ? nowMs - gRt[i].lastHeartbeatMs : 0;
+    Serial.printf("  axis=%u node=%u fb=%s age=%lums pos=%.4f vel=%.4f hb=%s age=%lums state=%u err=0x%08lX\n",
+                  i, gAxes[i].nodeId,
+                  axisFeedbackFresh(i, nowMs) ? "OK" : "STALE", feedbackAge,
+                  gRt[i].measuredTurns, gRt[i].measuredVel,
+                  (gRt[i].heartbeatValid && heartbeatAge <= ODRIVE_HEARTBEAT_TIMEOUT_MS) ? "OK" : "STALE",
+                  heartbeatAge, gRt[i].axisState, (unsigned long)gRt[i].axisError);
+  }
+}
+
+static void printDebugChannels(unsigned long nowMs) {
+  if (!gDebugMode) {
+    return;
+  }
+  if (nowMs - gDebugChannelsLastMs < DEBUG_CHANNELS_PERIOD_MS) {
+    return;
+  }
+  gDebugChannelsLastMs = nowMs;
+
+  Serial.printf("CRSF signal=%s CH:", _hasSignal ? "OK" : "LOST");
+  for (int i = 0; i < 16; i++) {
+    Serial.printf(" %u:%u", i + 1, _ch[i]);
+  }
+  Serial.println();
 }
 
 static void processSerialCalibrationCommands() {
@@ -926,6 +1031,25 @@ static void processSerialCalibrationCommands() {
       } else if (startsWith(cmd, "CAL FEED OFF")) {
         gCalLiveFeed = false;
         Serial.println("Calibration live feed OFF");
+      } else if (startsWith(cmd, "DEBUG ON")) {
+        gDebugMode = true;
+        gDebugChannelsLastMs = 0;
+        Serial.println("Debug mode ON: printing CRSF channels + raw CAN RX frames");
+      } else if (startsWith(cmd, "DEBUG OFF")) {
+        gDebugMode = false;
+        Serial.println("Debug mode OFF");
+      } else if (startsWith(cmd, "STATUS")) {
+        printSystemStatus();
+      } else if (startsWith(cmd, "FAULT CLEAR")) {
+        bool armed = hasSignal() && (getChannel(ARM_SWITCH_CHANNEL) > ARM_THRESHOLD);
+        if (armed) {
+          Serial.println("Refusing to clear fault while armed; disarm first");
+        } else if (!axesReadyForControl(millis())) {
+          Serial.println("Refusing to clear fault; all ODrive feedback must be fresh and error-free");
+        } else {
+          gOdriveFaultLatched = false;
+          Serial.println("ODrive safety latch cleared; re-arm to enable control");
+        }
       } else if (startsWith(cmd, "CAL HELP")) {
         printCalibrationHelp();
       } else {
@@ -958,6 +1082,11 @@ void demoArmSetup() {
     gRt[i].measuredTurns = 0.0f;
     gRt[i].measuredVel = 0.0f;
     gRt[i].measuredValid = false;
+    gRt[i].lastFeedbackMs = 0;
+    gRt[i].axisError = 0;
+    gRt[i].axisState = ODRIVE_AXIS_STATE_IDLE;
+    gRt[i].heartbeatValid = false;
+    gRt[i].lastHeartbeatMs = 0;
     gRt[i].rampStartTurns = gCal[i].homeTurns;
     gRt[i].rampStartMs = 0;
     gRt[i].rampingToHome = false;
@@ -992,21 +1121,42 @@ static void runNormalControl(unsigned long nowMs) {
   bool armed = hasSignal() && (getChannel(ARM_SWITCH_CHANNEL) > ARM_THRESHOLD);
   processCanRx();
 
+  bool axesReady = axesReadyForControl(nowMs);
+  if (armed && (!axesReady || gOdriveFaultLatched)) {
+    if (!gOdriveFaultLatched) {
+      gOdriveFaultLatched = true;
+      idleAllAxes();
+    }
+    if (nowMs - gLastSafetyReportMs >= 1000) {
+      Serial.println("!!! ODrive safety latch: stale encoder feedback or ODrive axis error; disarm, correct fault, then FAULT CLEAR");
+      gLastSafetyReportMs = nowMs;
+    }
+  }
+
   if (_canReady && armed != _prevArmed) {
     if (armed) {
-      for (int i = 0; i < 3; i++) {
-        sendOdriveControllerModes(gAxes[i].nodeId, ODRIVE_CONTROL_MODE_POSITION, ODRIVE_INPUT_MODE_PASSTHROUGH);
-        sendOdriveSetState(gAxes[i].nodeId, ODRIVE_AXIS_STATE_CLOSED_LOOP);
-        gRt[i].rampingToHome = false;
+      if (!gOdriveFaultLatched && axesReady) {
+        for (int i = 0; i < 3; i++) {
+          sendOdriveControllerModes(gAxes[i].nodeId, ODRIVE_CONTROL_MODE_POSITION, ODRIVE_INPUT_MODE_PASSTHROUGH);
+          sendOdriveSetState(gAxes[i].nodeId, ODRIVE_AXIS_STATE_CLOSED_LOOP);
+          gRt[i].rampingToHome = false;
+        }
+        Serial.println(">>> ARMED - CH control active");
+      } else {
+        Serial.println(">>> ARM INHIBITED - wait for fresh ODrive feedback and clear faults");
       }
-      Serial.println(">>> ARMED - CH control active");
     } else {
       for (int i = 0; i < 3; i++) {
         gRt[i].rampStartTurns = gRt[i].commandedTurns;
         gRt[i].rampStartMs = nowMs;
         gRt[i].rampingToHome = true;
       }
-      Serial.println(">>> SAFETY - returning all axes to home");
+      if (!gOdriveFaultLatched) {
+        Serial.println(">>> SAFETY - returning all axes to home");
+      } else {
+        idleAllAxes();
+        Serial.println(">>> SAFETY - ODrive fault latched, axes held idle");
+      }
     }
     _prevArmed = armed;
   }
@@ -1018,8 +1168,10 @@ static void runNormalControl(unsigned long nowMs) {
       requestCanFrame(gAxes[i].nodeId, ODRIVE_CMD_GET_ENCODER_ESTIMATES);
 
       float cmd;
-      if (armed) {
+      if (armed && !gOdriveFaultLatched && axesReady) {
         cmd = mapChannelToTurns(getChannel(gAxes[i].channel), gCal[i]);
+      } else if (gOdriveFaultLatched) {
+        continue;
       } else {
         cmd = getRampToHome(gCal[i], gRt[i], nowMs);
       }
@@ -1061,6 +1213,8 @@ void demoArmLoop() {
   } else {
     runNormalControl(nowMs);
   }
+
+  printDebugChannels(nowMs);
 }
 
 uint16_t getChannel(uint8_t ch) {

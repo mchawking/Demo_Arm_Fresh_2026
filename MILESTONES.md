@@ -45,5 +45,24 @@ End-to-end control loop validated: calibration → FRAM persistence → channel 
 
 ---
 
+## 2026-08-31 - ODrive Safety and Diagnostics
+
+### Summary
+- Added per-axis freshness tracking for ODrive encoder estimates received over CAN.
+- Added ODrive heartbeat monitoring for axis state and reported axis errors.
+- Added a safety latch that idles every axis and inhibits motion if feedback becomes stale or an ODrive axis reports an error.
+- Added `STATUS` serial output for CRSF, TWAI bus, ODrive feedback, heartbeat, state, and fault details.
+- Added guarded `FAULT CLEAR`, which requires the arm to be disarmed and all ODrive axes to report fresh, error-free feedback.
+- Changed calibration entry to idle all ODrive axes so the arm is torque-free for manual positioning.
+
+### Validation
+- Reinstalled the incomplete PlatformIO ESP32-S3 Xtensa toolchain.
+- Completed `pio run -e demo_arm` successfully after the toolchain repair.
+
+### Scope
+Encoder feedback remains on the ODrive and is read through CAN encoder estimates; no ESP32-direct encoder support was added.
+
+---
+
 ## Ready for Demo
 All core functionality tested and working. Ready to pick up tomorrow with multi-axis integration testing.
